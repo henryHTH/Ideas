@@ -1,1 +1,1 @@
-# Stratedy-Ideas
+# Ideas
