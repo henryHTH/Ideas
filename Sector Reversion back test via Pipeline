@@ -1,0 +1,199 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+import quantopian.algorithm as algo
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.classifiers import Classifier
+from quantopian.pipeline.factors import CustomFactor, Returns, Latest
+from quantopian.pipeline.filters import QTradableStocksUS,StaticAssets
+from quantopian.pipeline.classifiers.fundamentals import Sector
+import pandas as pd
+import numpy as np
+
+
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """
+    
+    context.sectors_map = {
+    101 : sid(19659), # Basic Materials 
+    102 : sid(19661), # Consumer Cyclical
+    103 : sid(19660), # Financial Services
+    104 : sid(19654), # Real Estate
+    205 : sid(19662), #Consumer Defensive
+    206 : sid(19656), #Healthcare
+    207 : sid(21652), #Utilities
+    308 : sid(21525), #Communication Services
+    309 : sid(19655), #Energy
+    310 : sid(19657), #Industrials
+    311 : sid(19658), #Technology
+    }
+    context.stock_long =[]
+    context.stock_short = []
+
+  
+    # Rebalance every day, 1 hour after market open.
+    algo.schedule_function(
+        getreadyfortrading,
+        algo.date_rules.week_start(),
+        algo.time_rules.market_open(hours=1),
+    )
+    algo.schedule_function(
+        rebalance,
+        algo.date_rules.week_start(0),
+        algo.time_rules.market_open(hours=1),
+    )
+    algo.schedule_function(
+        liquidate,
+        algo.date_rules.week_end(0),
+        algo.time_rules.market_close(hours=0.5),
+    )
+    # Create our dynamic stock selector.
+    algo.attach_pipeline(make_pipeline(), 'mean_reversion')
+    algo.attach_pipeline(make_pipeline_bmk(context),'bmk_etf_mean')
+    
+def make_pipeline():
+    returns = Returns(window_length = 6)
+    pipe = Pipeline(columns = {
+        'Sector' : Sector(),
+        'Return' : returns
+    },
+    screen = QTradableStocksUS())
+    return pipe
+
+def make_pipeline_bmk(context):
+    etfs = [x for x in context.sectors_map.values()]
+    universe = StaticAssets(etfs)
+    mean_return = Returns(inputs=[USEquityPricing.close], window_length=6,mask = universe)
+    pipe = Pipeline(columns = {'sector_mean' : mean_return},screen = universe)
+    return pipe
+
+def getreadyfortrading(context, data):
+    """
+    Called every day before market open.
+    """
+    context.output = algo.pipeline_output('mean_reversion')
+    context.output_bmk = algo.pipeline_output('bmk_etf_mean')
+    #print(context.output.to_string())
+    #print(context.output_bmk.to_string())
+    # These are the securities that we are interested in trading each day.
+    context.security_list = context.output.index
+    
+    etf_map = dict((y,x) for x,y in context.sectors_map.iteritems())
+    
+    context.output_bmk.index = context.output_bmk.index.set_names('stock')
+    context.output_bmk.reset_index(inplace=True)
+    context.output_bmk['sector'] = context.output_bmk.stock.map(etf_map)
+    context.sector = context.output_bmk.set_index('sector')
+    '''
+    try:
+        context.bmk_return_long = context.sector.loc[context.top_sector]['sector_mean']
+        stock_top_sector = context.output.loc[context.output['Sector'] == context.top_sector]
+        context.stock_to_long_today = stock_top_sector[stock_top_sector['Return'] < context.bmk_return_long]
+
+        context.bmk_return_short = context.sector.loc[context.bottom_sector]['sector_mean']
+        stock_bottom_sector = context.output.loc[context.output['Sector'] == context.bottom_sector]
+        context.stock_to_short_today = stock_bottom_sector[stock_bottom_sector['Return'] > context.bmk_return_short]
+    except KeyError as k:
+        print(k)
+    '''
+    
+
+    # find the stocks whose returns below average in top performance sector 
+    context.top_sector = context.output_bmk['sector'][context.output_bmk['sector_mean'].idxmax()]
+    stock_top_sector = context.output.loc[context.output['Sector'] == context.top_sector]
+    top_mean_return = context.sector.loc[context.top_sector]['sector_mean']
+    context.stock_to_long_df = stock_top_sector[stock_top_sector['Return'] < top_mean_return]
+    stock_to_long_return =  top_mean_return - context.stock_to_long_df['Return'] 
+    
+    context.stock_to_long_weights  = (stock_to_long_return .div(stock_to_long_return.sum()))/2
+    context.stock_to_long = context.stock_to_long_df.index[:]
+    log.info(context.top_sector)
+    log.info(context.stock_to_long)
+
+    # find the stocks whose returns above average in bottom performance sector
+    context.bottom_sector = context.output_bmk['sector'][context.output_bmk['sector_mean'].idxmin()]
+    stock_bottom_sector = context.output.loc[context.output['Sector'] == context.bottom_sector]
+    bottom_mean_return = context.sector.loc[context.bottom_sector]['sector_mean']
+    context.stock_to_short_df = stock_bottom_sector[stock_bottom_sector['Return'] > bottom_mean_return] 
+    stock_to_short_return = context.stock_to_short_df['Return'] - bottom_mean_return
+    
+    context.stock_to_short_weights  = (stock_to_short_return.div(stock_to_short_return.sum()))/2
+    context.stock_to_short = context.stock_to_short_df.index[:]
+    log.info(context.bottom_sector)
+    log.info(context.stock_to_short)
+
+
+
+    #calculate average return for each sector and get top and bottom sector id 
+    #sector_mean = context.output.groupby('Sector').mean()
+    '''
+    context.etf = [x for x in context.sectors_map.values()]
+    prices_sector = data.history(context.etf, 'price', 7, '1d')[:-1]
+    returns_sector = prices_sector.pct_change(periods = 5)[-1:].T
+    etf_hedge_for_top_sector = returns_sector.idxmax().values[0]
+    etf_hedge_for_bottom_sector = returns_sector.idxmin().values[0]
+    top_sector_mean = returns_sector.loc[etf_hedge_for_top_sector][0]
+    
+    sector_max_id = context.sectors_map.keys()[context.sectors_map.values().index(etf_hedge_for_top_sector)]
+    sector_min_id = context.sectors_map.keys()[context.sectors_map.values().index(etf_hedge_for_bottom_sector)]
+
+
+    context.longs = context.output[context.output['Sector'] == sector_max_id]
+    context.longs = 
+    
+    context.shorts = context.output[context.output['Sector'] == sector_min_id]
+    '''
+    
+    
+    
+def rebalance(context, data):
+    """
+    Execute orders according to our schedule_function() timing.
+    """
+
+    # Rebalance all stocks to target weights  
+    if len(context.stock_to_long)>0:
+        for i in range(len(context.stock_to_long)):
+            order_target_percent(context.stock_to_long[i],0)#context.stock_to_long_weights[i])
+        context.stock_long = context.stock_to_long
+        context.stock_to_long = []
+       # order_target_percent(context.sectors_map[context.top_sector],-sum(context.stock_to_long_weights))
+        
+
+    if len(context.stock_to_short)>0:
+        for i in range(len(context.stock_to_short)):
+            order_target_percent(context.stock_to_short[i], -context.stock_to_short_weights[i])
+        context.stock_short = context.stock_to_short
+        context.stock_to_short = []
+        order_target_percent(context.sectors_map[context.bottom_sector],sum(context.stock_to_short_weights))
+    # track how many positions we're holding  
+    record(num_lpositions = len(context.stock_long))
+    record(num_spositions = len(context.stock_short))
+
+
+def liquidate(context, data):
+             
+    log.info('liquidate')
+                                         
+    for stock in context.portfolio.positions:  
+        order_target_percent(stock, 0)
+
+
+
+def record_vars(context, data):
+    """
+    Plot variables at the end of each day.
+    """
+    pass
+
+
+def handle_data(context, data):
+    """
+    Called every minute.
+    """
+    pass
