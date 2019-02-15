@@ -1,0 +1,143 @@
+import quantopian.optimize as opt
+import quantopian.algorithm as algo
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.filters.morningstar import Q1500US
+from quantopian.pipeline.data.sentdex import sentiment
+from quantopian.pipeline.data.morningstar import operation_ratios
+from quantopian.pipeline.experimental import risk_loading_pipeline
+from quantopian.pipeline.classifiers.morningstar import Sector
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """   
+    
+    UNIVERSE_SIZE = 500
+    MIN_MARKET_CAP_PERCENTILE = 50
+    LIQUIDITY_LOOKBACK_LENGTH = 100
+
+    # Constraint Parameters
+    MAX_GROSS_LEVERAGE = 1.0
+    context.MAX_SHORT_POSITION_SIZE = 0.01  # 1.5%
+    context.MAX_LONG_POSITION_SIZE = 0.01   # 1.5%
+
+    # Scheduling Parameters
+    MINUTES_AFTER_OPEN_TO_TRADE = 10
+    BASE_UNIVERSE_RECALCULATE_FREQUENCY = 'month_start'  # {week,quarter,year}_start are also valid
+
+
+    # Rebalance every day, 1 hour after market open.
+    schedule_function(my_rebalance, date_rules.every_day(), time_rules.market_open(minutes=MINUTES_AFTER_OPEN_TO_TRADE),half_days =False)
+     
+    # Record tracking variables at the end of each day.
+    schedule_function(my_record_vars, date_rules.every_day(), time_rules.market_close())
+     
+    # Create our dynamic stock selector.
+    algo.attach_pipeline(make_pipeline(), 'my_pipeline')
+    
+    #set_commission(commission.PerTrade(cost=0.001))
+    
+    algo.attach_pipeline(risk_loading_pipeline(), 'risk_factors')
+
+def make_pipeline():
+    # Yes: operation_ratios.revenue_growth, operation_ratios.operation_margin, sentiment
+    
+    testing_factor1 = operation_ratios.operation_margin.latest
+    testing_factor2 = operation_ratios.revenue_growth.latest
+    testing_factor3 = sentiment.sentiment_signal.latest
+    
+    universe = (Q1500US() &
+               testing_factor1.notnull() &
+               testing_factor2.notnull() &
+               testing_factor3.notnull())
+    
+    testing_factor1 = testing_factor1.winsorize(min_percentile=0.05, max_percentile=0.95)
+    testing_factor2 = testing_factor2.winsorize(min_percentile=0.05, max_percentile=0.95)
+    testing_factor3 = testing_factor3.winsorize(min_percentile=0.05, max_percentile=0.95)
+    
+    testing_factor = testing_factor1.zscore() + testing_factor2.zscore() + testing_factor3.zscore()*0.5
+    
+    #testing_quantiles = testing_factor.quantiles(2)
+    
+    pipe = Pipeline(columns={
+            'testing_factor':testing_factor,'sector' : Sector()},
+        #'shorts':testing_quantiles.eq(0),
+       # 'longs':testing_quantiles.eq(1)},
+                    
+                   screen=universe & Sector().notnull())
+    return pipe
+
+
+def before_trading_start(context, data):
+    try:
+        """
+        Called every day before market open.
+        """
+        context.output = algo.pipeline_output('my_pipeline')
+        
+        context.risk_loadings = algo.pipeline_output('risk_factors')
+
+        # These are the securities that we are interested in trading each day.
+        context.security_list = context.output.index.tolist()
+    except Exception as e:
+        print(str(e))
+    
+ 
+def my_rebalance(context,data):
+    """
+    Place orders according to our schedule_function() timing.
+    """
+    pipeline_data = context.output
+    risk_loadings = context.risk_loadings
+    
+    MAX_GROSS_LEVERAGE = 1.0
+
+    
+    objective = opt.MaximizeAlpha(pipeline_data.testing_factor)
+    
+    market_neutral = opt.DollarNeutral()
+    constrain_gross_leverage  = opt.MaxGrossExposure(MAX_GROSS_LEVERAGE)
+    
+    neutralize_risk_factors = opt.experimental.RiskModelExposure(
+        risk_model_loadings = risk_loadings,
+        version  = 0
+    )
+    
+    constrain_pos_size  = opt.PositionConcentration.with_equal_bounds(
+        min = - context.MAX_SHORT_POSITION_SIZE,
+        max = context.MAX_LONG_POSITION_SIZE
+    )
+
+    
+    sector_neutral = opt.NetPartitionExposure.with_equal_bounds(
+        labels=pipeline_data.sector,
+        min=-0.0001,
+        max=0.0001,
+    )
+    
+    algo.order_optimal_portfolio(
+        objective = objective,
+        constraints = [
+            constrain_gross_leverage,
+            constrain_pos_size,
+            market_neutral,
+            neutralize_risk_factors
+        ]
+    )
+    # Compute our portfolio weights.
+    
+def my_record_vars(context, data):
+    """
+    Plot variables at the end of each day.
+    """
+    long_count = 0
+    short_count = 0
+
+    for position in context.portfolio.positions.itervalues():
+        if position.amount > 0:
+            long_count += 1
+        if position.amount < 0:
+            short_count += 1
+            
+    # Plot the counts
+    record(num_long=long_count, num_short=short_count, leverage=context.account.leverage)
